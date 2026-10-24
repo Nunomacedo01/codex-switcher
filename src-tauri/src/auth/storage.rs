@@ -1,8 +1,9 @@
-//! Account storage module - manages reading and writing accounts.json
+//! Account storage; each mutation reads fresh state under a cross-process file lock.
 
 use std::fs;
 use std::path::PathBuf;
 
+use super::persistence::{atomic_write, protect, read_limited, unprotect};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
@@ -68,19 +69,22 @@ pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson)
 pub fn get_config_dir() -> Result<PathBuf> {
     #[cfg(test)]
     {
-        Ok(super::test_support::home_dir()?.join(".codex-switcher"))
+        Ok(super::test_support::home_dir()?.join(".codex-switcher-local"))
     }
 
     #[cfg(not(test))]
     {
         let home = dirs::home_dir().context("Could not find home directory")?;
-        Ok(home.join(".codex-switcher"))
+        Ok(home.join(".codex-switcher-local"))
     }
 }
 
-/// Get the path to accounts.json
 pub fn get_accounts_file() -> Result<PathBuf> {
-    Ok(get_config_dir()?.join("accounts.json"))
+    Ok(get_config_dir()?.join(if cfg!(windows) {
+        "accounts.dpapi"
+    } else {
+        "accounts.json"
+    }))
 }
 
 pub fn get_settings_file() -> Result<PathBuf> {
@@ -91,14 +95,21 @@ pub fn get_settings_file() -> Result<PathBuf> {
 pub fn load_accounts() -> Result<AccountsStore> {
     let path = get_accounts_file()?;
 
-    if !path.exists() {
-        return Ok(AccountsStore::default());
-    }
-
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read accounts file: {}", path.display()))?;
-
-    let store: AccountsStore = serde_json::from_str(&content)
+    let content = match read_limited(&path) {
+        Ok(content) => content,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(AccountsStore::default());
+        }
+        Err(error) => {
+            return Err(error.context(format!("Failed to read accounts file: {}", path.display())))
+        }
+    };
+    let plaintext = unprotect(&content)?;
+    let store: AccountsStore = serde_json::from_slice(&plaintext)
         .with_context(|| format!("Failed to parse accounts file: {}", path.display()))?;
 
     Ok(store)
@@ -129,7 +140,7 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
-    fs::write(&path, content)
+    atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write settings file: {}", path.display()))?;
 
     #[cfg(unix)]
@@ -142,8 +153,7 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<()> {
     Ok(())
 }
 
-/// Save the accounts store to disk
-pub fn save_accounts(store: &AccountsStore) -> Result<()> {
+fn write_accounts(store: &AccountsStore) -> Result<()> {
     let path = get_accounts_file()?;
 
     // Ensure the config directory exists
@@ -152,10 +162,13 @@ pub fn save_accounts(store: &AccountsStore) -> Result<()> {
             .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
     }
 
-    let content =
-        serde_json::to_string_pretty(store).context("Failed to serialize accounts store")?;
-
-    fs::write(&path, content)
+    let content = serde_json::to_vec(store).context("Failed to serialize accounts store")?;
+    let encrypted = protect(&content)?;
+    anyhow::ensure!(
+        encrypted.len() as u64 <= super::persistence::MAX_ACCOUNT_BYTES,
+        "Account store is too large"
+    );
+    atomic_write(&path, &encrypted)
         .with_context(|| format!("Failed to write accounts file: {}", path.display()))?;
 
     // Set restrictive permissions on Unix
@@ -169,13 +182,35 @@ pub fn save_accounts(store: &AccountsStore) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn update_accounts<T>(
+    update: impl FnOnce(&mut AccountsStore) -> Result<T>,
+) -> Result<T> {
+    let directory = get_config_dir()?;
+    fs::create_dir_all(&directory)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("accounts.lock"))?;
+    lock.lock().context("Could not lock the account store")?;
+    let mut store = load_accounts()?;
+    let result = update(&mut store)?;
+    write_accounts(&store)?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn save_accounts(store: &AccountsStore) -> Result<()> {
+    update_accounts(|current| {
+        *current = store.clone();
+        Ok(())
+    })
+}
+
 /// Add a new account to the store
 pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
-
-    let stored = add_account_to_store(&mut store, account)?;
-    save_accounts(&store)?;
-    Ok(stored)
+    update_accounts(|store| add_account_to_store(store, account))
 }
 
 fn add_account_to_store(
@@ -194,36 +229,21 @@ fn add_account_to_store(
 
 /// Remove an account by ID
 pub fn remove_account(account_id: &str) -> Result<()> {
-    let mut store = load_accounts()?;
+    update_accounts(|store| {
+        let initial_len = store.accounts.len();
+        store.accounts.retain(|a| a.id != account_id);
 
-    let initial_len = store.accounts.len();
-    store.accounts.retain(|a| a.id != account_id);
+        if store.accounts.len() == initial_len {
+            anyhow::bail!("Account not found: {account_id}");
+        }
 
-    if store.accounts.len() == initial_len {
-        anyhow::bail!("Account not found: {account_id}");
-    }
+        // Removing a saved account does not sign into another account.
+        if store.active_account_id.as_deref() == Some(account_id) {
+            store.active_account_id = None;
+        }
 
-    // If we removed the active account, clear it or set to first available
-    if store.active_account_id.as_deref() == Some(account_id) {
-        store.active_account_id = store.accounts.first().map(|a| a.id.clone());
-    }
-
-    save_accounts(&store)?;
-    Ok(())
-}
-
-/// Update the active account ID
-pub fn set_active_account(account_id: &str) -> Result<()> {
-    let mut store = load_accounts()?;
-
-    // Verify the account exists
-    if !store.accounts.iter().any(|a| a.id == account_id) {
-        anyhow::bail!("Account not found: {account_id}");
-    }
-
-    store.active_account_id = Some(account_id.to_string());
-    save_accounts(&store)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Get an account by ID
@@ -242,18 +262,6 @@ pub fn get_active_account() -> Result<Option<StoredAccount>> {
     Ok(store.accounts.into_iter().find(|a| a.id == *active_id))
 }
 
-/// Update an account's last_used_at timestamp
-pub fn touch_account(account_id: &str) -> Result<()> {
-    let mut store = load_accounts()?;
-
-    if let Some(account) = store.accounts.iter_mut().find(|a| a.id == account_id) {
-        account.last_used_at = Some(chrono::Utc::now());
-        save_accounts(&store)?;
-    }
-
-    Ok(())
-}
-
 /// Update an account's metadata (name, email, plan_type, subscription expiry)
 pub fn update_account_metadata(
     account_id: &str,
@@ -262,62 +270,61 @@ pub fn update_account_metadata(
     plan_type: Option<String>,
     subscription_expires_at: Option<Option<DateTime<Utc>>>,
 ) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
+    update_accounts(|store| {
+        // Check for duplicate names first (if renaming)
+        if let Some(ref new_name) = name {
+            if store
+                .accounts
+                .iter()
+                .any(|a| a.id != account_id && a.name == *new_name)
+            {
+                anyhow::bail!("An account with name '{new_name}' already exists");
+            }
+        }
 
-    // Check for duplicate names first (if renaming)
-    if let Some(ref new_name) = name {
-        if store
+        // Now find and update the account
+        let account = store
             .accounts
-            .iter()
-            .any(|a| a.id != account_id && a.name == *new_name)
-        {
-            anyhow::bail!("An account with name '{new_name}' already exists");
+            .iter_mut()
+            .find(|a| a.id == account_id)
+            .context("Account not found")?;
+
+        let mut changed = false;
+
+        if let Some(new_name) = name {
+            if account.name != new_name {
+                account.name = new_name;
+                changed = true;
+            }
         }
-    }
 
-    // Now find and update the account
-    let account = store
-        .accounts
-        .iter_mut()
-        .find(|a| a.id == account_id)
-        .context("Account not found")?;
-
-    let mut changed = false;
-
-    if let Some(new_name) = name {
-        if account.name != new_name {
-            account.name = new_name;
-            changed = true;
+        if let Some(new_email) = email {
+            if account.email.as_ref() != Some(&new_email) {
+                account.email = Some(new_email);
+                changed = true;
+            }
         }
-    }
 
-    if let Some(new_email) = email {
-        if account.email.as_ref() != Some(&new_email) {
-            account.email = Some(new_email);
-            changed = true;
+        if let Some(new_plan_type) = plan_type {
+            if account.plan_type.as_ref() != Some(&new_plan_type) {
+                account.plan_type = Some(new_plan_type);
+                changed = true;
+            }
         }
-    }
 
-    if let Some(new_plan_type) = plan_type {
-        if account.plan_type.as_ref() != Some(&new_plan_type) {
-            account.plan_type = Some(new_plan_type);
-            changed = true;
+        if let Some(subscription_expires_at) = subscription_expires_at {
+            if account.subscription_expires_at != subscription_expires_at {
+                account.subscription_expires_at = subscription_expires_at;
+                changed = true;
+            }
         }
-    }
 
-    if let Some(subscription_expires_at) = subscription_expires_at {
-        if account.subscription_expires_at != subscription_expires_at {
-            account.subscription_expires_at = subscription_expires_at;
-            changed = true;
+        let updated = account.clone();
+        if changed {
+            println!("[Account] Saved updated metadata for: {}", updated.name);
         }
-    }
-
-    let updated = account.clone();
-    if changed {
-        save_accounts(&store)?;
-        println!("[Account] Saved updated metadata for: {}", updated.name);
-    }
-    Ok(updated)
+        Ok(updated)
+    })
 }
 
 /// Update ChatGPT OAuth tokens for an account and return the updated account.
@@ -331,48 +338,47 @@ pub fn update_account_chatgpt_tokens(
     plan_type: Option<String>,
     subscription_expires_at: Option<DateTime<Utc>>,
 ) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
+    update_accounts(|store| {
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == account_id)
+            .context("Account not found")?;
 
-    let account = store
-        .accounts
-        .iter_mut()
-        .find(|a| a.id == account_id)
-        .context("Account not found")?;
-
-    match &mut account.auth_data {
-        AuthData::ChatGPT {
-            id_token: stored_id_token,
-            access_token: stored_access_token,
-            refresh_token: stored_refresh_token,
-            account_id: stored_account_id,
-        } => {
-            *stored_id_token = id_token;
-            *stored_access_token = access_token;
-            *stored_refresh_token = refresh_token;
-            if let Some(new_account_id) = chatgpt_account_id {
-                *stored_account_id = Some(new_account_id);
+        match &mut account.auth_data {
+            AuthData::ChatGPT {
+                id_token: stored_id_token,
+                access_token: stored_access_token,
+                refresh_token: stored_refresh_token,
+                account_id: stored_account_id,
+            } => {
+                *stored_id_token = id_token;
+                *stored_access_token = access_token;
+                *stored_refresh_token = refresh_token;
+                if let Some(new_account_id) = chatgpt_account_id {
+                    *stored_account_id = Some(new_account_id);
+                }
+            }
+            AuthData::ApiKey { .. } => {
+                anyhow::bail!("Cannot update OAuth tokens for an API key account");
             }
         }
-        AuthData::ApiKey { .. } => {
-            anyhow::bail!("Cannot update OAuth tokens for an API key account");
+
+        if let Some(new_email) = email {
+            account.email = Some(new_email);
         }
-    }
 
-    if let Some(new_email) = email {
-        account.email = Some(new_email);
-    }
+        if let Some(new_plan_type) = plan_type {
+            account.plan_type = Some(new_plan_type);
+        }
 
-    if let Some(new_plan_type) = plan_type {
-        account.plan_type = Some(new_plan_type);
-    }
+        if let Some(subscription_expires_at) = subscription_expires_at {
+            account.subscription_expires_at = Some(subscription_expires_at);
+        }
 
-    if let Some(subscription_expires_at) = subscription_expires_at {
-        account.subscription_expires_at = Some(subscription_expires_at);
-    }
-
-    let updated = account.clone();
-    save_accounts(&store)?;
-    Ok(updated)
+        let updated = account.clone();
+        Ok(updated)
+    })
 }
 
 /// Get the list of masked account IDs
@@ -383,10 +389,10 @@ pub fn get_masked_account_ids() -> Result<Vec<String>> {
 
 /// Set the list of masked account IDs
 pub fn set_masked_account_ids(ids: Vec<String>) -> Result<()> {
-    let mut store = load_accounts()?;
-    store.masked_account_ids = ids;
-    save_accounts(&store)?;
-    Ok(())
+    update_accounts(|store| {
+        store.masked_account_ids = ids;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -394,6 +400,49 @@ mod tests {
     use super::{add_account_to_store, sync_active_account_tokens};
     use crate::types::{AccountsStore, AuthData, AuthDotJson, StoredAccount, TokenData};
     use base64::Engine;
+
+    #[test]
+    fn concurrent_writers_preserve_each_account() {
+        let home = super::super::test_support::TestHome::new();
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let root = home.path();
+                std::thread::spawn(move || {
+                    let _home = super::super::test_support::TestHome::enter(root);
+                    for index in 0..8 {
+                        super::add_account(StoredAccount::new_api_key(
+                            format!("worker-{worker}-{index}"),
+                            "synthetic-key".into(),
+                        ))
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(super::load_accounts().unwrap().accounts.len(), 32);
+        assert!(super::load_accounts().unwrap().active_account_id.is_none());
+    }
+
+    #[test]
+    fn removing_active_account_does_not_mark_another_account_active() {
+        let _home = super::super::test_support::TestHome::new();
+        let first = StoredAccount::new_api_key("first".into(), "synthetic-first".into());
+        let id = first.id.clone();
+        super::save_accounts(&AccountsStore {
+            accounts: vec![
+                first,
+                StoredAccount::new_api_key("second".into(), "synthetic-second".into()),
+            ],
+            active_account_id: Some(id.clone()),
+            ..AccountsStore::default()
+        })
+        .unwrap();
+        super::remove_account(&id).unwrap();
+        assert!(super::load_accounts().unwrap().active_account_id.is_none());
+    }
 
     fn account(name: &str, account_id: &str, suffix: &str) -> StoredAccount {
         StoredAccount::new_chatgpt(

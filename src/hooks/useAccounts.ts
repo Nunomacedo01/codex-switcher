@@ -4,8 +4,7 @@ import type {
   UsageInfo,
   AccountWithUsage,
   WarmupSummary,
-  ImportAccountsSummary,
-} from "../types";
+  } from "../types";
 import { invokeBackend, isTauriRuntime, type FileSource } from "../lib/platform";
 
 export function useAccounts() {
@@ -318,15 +317,7 @@ export function useAccounts() {
   const importFromFile = useCallback(
     async (source: FileSource, name: string) => {
       try {
-        if (typeof source === "string") {
-          await invokeBackend<AccountInfo>("add_account_from_file", { path: source, name });
-        } else {
-          const contents = await source.text();
-          await invokeBackend<AccountInfo>("add_account_from_auth_json_text", {
-            name,
-            contents,
-          });
-        }
+        await invokeBackend<AccountInfo>("add_account_from_file", { path: source, name });
         const accountList = await loadAccounts();
         await refreshUsage(accountList);
       } catch (err) {
@@ -358,58 +349,6 @@ export function useAccounts() {
       throw err;
     }
   }, [loadAccounts, refreshUsage]);
-
-  const exportAccountsSlimText = useCallback(async () => {
-    try {
-      return await invokeBackend<string>("export_accounts_slim_text");
-    } catch (err) {
-      throw err;
-    }
-  }, []);
-
-  const importAccountsSlimText = useCallback(
-    async (payload: string) => {
-      try {
-        const summary = await invokeBackend<ImportAccountsSummary>("import_accounts_slim_text", {
-          payload,
-        });
-        const accountList = await loadAccounts();
-        await refreshUsage(accountList);
-        return summary;
-      } catch (err) {
-        throw err;
-      }
-    },
-    [loadAccounts, refreshUsage]
-  );
-
-  const exportAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
-      try {
-        await invokeBackend("export_accounts_full_encrypted_file", { path });
-      } catch (err) {
-        throw err;
-      }
-    },
-    []
-  );
-
-  const importAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
-      try {
-        const summary = await invokeBackend<ImportAccountsSummary>(
-          "import_accounts_full_encrypted_file",
-          { path }
-        );
-        const accountList = await loadAccounts();
-        await refreshUsage(accountList);
-        return summary;
-      } catch (err) {
-        throw err;
-      }
-    },
-    [loadAccounts, refreshUsage]
-  );
 
   const cancelOAuthLogin = useCallback(async () => {
     try {
@@ -488,10 +427,6 @@ export function useAccounts() {
     deleteAccount,
     renameAccount,
     importFromFile,
-    exportAccountsSlimText,
-    importAccountsSlimText,
-    exportAccountsFullEncryptedFile,
-    importAccountsFullEncryptedFile,
     startOAuthLogin,
     completeOAuthLogin,
     cancelOAuthLogin,

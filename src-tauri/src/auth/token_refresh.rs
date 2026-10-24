@@ -6,8 +6,8 @@ use chrono::Utc;
 use tokio::time::{sleep, Duration};
 
 use super::{
-    load_accounts, read_current_auth, save_accounts, switch_to_account, sync_active_account_tokens,
-    update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
+    load_accounts, read_current_auth, switch_to_account, sync_active_account_tokens,
+    update_account_chatgpt_tokens, update_accounts, AUTH_OPERATION_LOCK,
 };
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
@@ -157,52 +157,23 @@ fn reconcile_active_account_from_auth(
 }
 
 fn load_account_reconciling_live_auth(account_id: &str) -> Result<(StoredAccount, bool)> {
-    let mut store = load_accounts()?;
-    let is_active = store.active_account_id.as_deref() == Some(account_id);
+    update_accounts(|store| {
+        let is_active = store.active_account_id.as_deref() == Some(account_id);
 
-    if is_active {
-        if let Some(auth) = read_current_auth()? {
-            if reconcile_active_account_from_auth(&mut store, account_id, &auth) {
-                save_accounts(&store)?;
+        if is_active {
+            if let Some(auth) = read_current_auth()? {
+                reconcile_active_account_from_auth(store, account_id, &auth);
             }
         }
-    }
 
-    let account = store
-        .accounts
-        .into_iter()
-        .find(|stored| stored.id == account_id)
-        .context("Account not found")?;
-    Ok((account, is_active))
-}
-
-/// Build a new ChatGPT account from a refresh token.
-/// This is used by slim import to recreate full credentials.
-pub async fn create_chatgpt_account_from_refresh_token(
-    account_name: String,
-    refresh_token: String,
-) -> Result<StoredAccount> {
-    if refresh_token.trim().is_empty() {
-        anyhow::bail!("Missing refresh token for account {account_name}");
-    }
-
-    let refreshed = refresh_tokens_with_refresh_token(&refresh_token).await?;
-    let id_token = refreshed
-        .id_token
-        .context("Refresh response did not include id_token")?;
-    let next_refresh_token = refreshed.refresh_token.unwrap_or(refresh_token);
-    let claims = parse_chatgpt_id_token_claims(&id_token);
-
-    Ok(StoredAccount::new_chatgpt(
-        account_name,
-        claims.email,
-        claims.plan_type,
-        claims.subscription_expires_at,
-        id_token,
-        refreshed.access_token,
-        next_refresh_token,
-        claims.account_id,
-    ))
+        let account = store
+            .accounts
+            .iter()
+            .find(|stored| stored.id == account_id)
+            .cloned()
+            .context("Account not found")?;
+        Ok((account, is_active))
+    })
 }
 
 fn chatgpt_tokens_need_refresh(account: &StoredAccount) -> bool {

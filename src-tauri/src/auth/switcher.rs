@@ -48,7 +48,7 @@ pub fn switch_to_account(account: &StoredAccount) -> Result<()> {
     let content =
         serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
 
-    fs::write(&auth_path, content)
+    super::persistence::atomic_write(&auth_path, content.as_bytes())
         .with_context(|| format!("Failed to write auth.json: {}", auth_path.display()))?;
 
     // Set restrictive permissions on Unix
@@ -90,8 +90,10 @@ fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
 
 /// Import an account from an existing auth.json file
 pub fn import_from_auth_json(path: &str, account_name: String) -> Result<StoredAccount> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read auth.json: {path}"))?;
+    let content = String::from_utf8(super::persistence::read_limited(std::path::Path::new(
+        path,
+    ))?)
+    .with_context(|| format!("Failed to read auth.json: {path}"))?;
 
     import_from_auth_json_contents(&content, account_name)
         .with_context(|| format!("Failed to parse auth.json: {path}"))

@@ -7,6 +7,19 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const probeSource = `
+pub mod commands {
+    pub struct Summary { pub imported_count: usize, pub skipped_count: usize }
+    pub fn import_legacy_accounts(_: &std::path::Path) -> Result<Summary, std::io::Error> {
+        unreachable!("the startup probe must not import credentials")
+    }
+}
+pub mod auth {
+    pub fn get_config_dir() -> std::io::Result<std::path::PathBuf> {
+        std::env::var_os("CODEX_SWITCHER_STARTUP_TEST_HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| std::io::Error::other("missing isolated test home"))
+    }
+}
 pub fn run() {
     for name in ["GTK_MODULES", "GTK3_MODULES", "GDK_BACKEND"] {
         match std::env::var_os(name) {
@@ -17,14 +30,12 @@ pub fn run() {
 }
 `;
 
-test("Linux entry point filters modules before starting Tauri", {
-  skip: process.platform !== "linux",
-}, async (t) => {
+test("entry point starts in an isolated home and filters GTK modules on Linux", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-switcher-startup-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const probe = join(directory, "probe.rs");
   const library = join(directory, "libcodex_switcher_lib.rlib");
-  const executable = join(directory, "startup");
+  const executable = join(directory, process.platform === "win32" ? "startup.exe" : "startup");
   const main = fileURLToPath(new URL("../src-tauri/src/main.rs", import.meta.url));
   writeFileSync(probe, probeSource);
 
@@ -84,7 +95,9 @@ test("Linux entry point filters modules before starting Tauri", {
 
   for (const { name, modules, gtk3, expectedModules, expectedGtk3 } of cases) {
     await t.test(name, () => {
-      const env: Record<string, string | undefined> = { ...process.env, GDK_BACKEND: "wayland" };
+      const env: Record<string, string | undefined> = {
+        ...process.env, GDK_BACKEND: "wayland", CODEX_SWITCHER_STARTUP_TEST_HOME: directory,
+      };
       delete env.GTK_MODULES;
       delete env.GTK3_MODULES;
       if (modules !== undefined) env.GTK_MODULES = modules;
@@ -93,8 +106,8 @@ test("Linux entry point filters modules before starting Tauri", {
       assert.ifError(result.error);
       assert.equal(result.status, 0, result.stderr);
       assert.equal(result.stdout, [
-        `GTK_MODULES=${expectedModules ?? "<unset>"}`,
-        `GTK3_MODULES=${expectedGtk3 ?? "<unset>"}`,
+        `GTK_MODULES=${(process.platform === "linux" ? expectedModules : modules) ?? "<unset>"}`,
+        `GTK3_MODULES=${(process.platform === "linux" ? expectedGtk3 : gtk3) ?? "<unset>"}`,
         "GDK_BACKEND=wayland",
         "",
       ].join("\n"));

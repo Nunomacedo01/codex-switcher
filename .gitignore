@@ -10,6 +10,10 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+auth.json
+accounts.json
+*.dpapi
+.codex-switcher-local/
 *.local
 
 # Editor directories and files

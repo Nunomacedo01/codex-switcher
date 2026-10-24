@@ -17,6 +17,7 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 pub(crate) struct TestHome {
     root: PathBuf,
+    owns_directory: bool,
 }
 
 impl TestHome {
@@ -26,7 +27,23 @@ impl TestHome {
             std::env::temp_dir().join(format!("codex-switcher-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         TEST_HOME.with(|home| *home.borrow_mut() = Some(root.clone()));
-        Self { root }
+        Self {
+            root,
+            owns_directory: true,
+        }
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    pub(crate) fn enter(root: PathBuf) -> Self {
+        assert!(home_dir().is_err(), "test homes must not be nested");
+        TEST_HOME.with(|home| *home.borrow_mut() = Some(root.clone()));
+        Self {
+            root,
+            owns_directory: false,
+        }
     }
 }
 
@@ -34,6 +51,8 @@ impl Drop for TestHome {
     fn drop(&mut self) {
         TEST_HOME.with(|home| *home.borrow_mut() = None);
         // Only remove the unique temporary directory created by this fixture.
-        let _ = fs::remove_dir_all(&self.root);
+        if self.owns_directory {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
